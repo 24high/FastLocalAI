@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B on 16 GB VRAM with Lucebox + OpenCode
 
-A tuned local coding stack for running **Qwen3.6-35B-A3B** on a Linux workstation with an NVIDIA GPU, **16 GB VRAM**, and **64 GB system RAM**.
+A tuned local coding stack for running **Qwen3.6-35B-A3B** on a Linux workstation with an NVIDIA GPU, **16 GB VRAM**, and **64 GB system RAM**. This is rather an example of what can be done using Lucebox than a real world tutorial.
 
 
 ## Warning: The context window in this setup is really low. You can extend it to 32k at the cost of processing speed.

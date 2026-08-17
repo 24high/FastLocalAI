@@ -2,6 +2,11 @@
 
 A tuned local coding stack for running **Qwen3.6-35B-A3B** on a Linux workstation with an NVIDIA GPU, **16 GB VRAM**, and **64 GB system RAM**.
 
+
+## Warning: The context window in this setup is really low. You can extend it to 32k at the cost of processing speed.
+
+## Qwen3.8 IQ3 M will most likely perform better both quality- and speedwise, yet allowing a 64k context window. https://huggingface.co/bartowski/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-IQ3_M.gguf
+
 The project uses the prebuilt Lucebox CUDA container and the `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` quantization. The main goal is to make a relatively large MoE coding model practical on consumer hardware while keeping OpenCode interactive enough for agentic coding.
 
 The benchmarked configuration focuses on:

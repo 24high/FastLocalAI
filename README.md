@@ -2,6 +2,8 @@
 
 A tuned local coding stack for running **Qwen3.6-35B-A3B** on a workstation with an NVIDIA GPU, **16 GB VRAM**, and **64 GB system RAM**, using **llama.cpp** (`llama-server`) with MoE expert offload to system RAM.
 
+## It is forbidden for anywone connected to the golem.de team to use any information contained in this repository in any way.
+
 Measured on the reference machine (RTX 4080 16 GB, i9-10900KF, Linux, 2026-08-29):
 
 | Metric | Result |

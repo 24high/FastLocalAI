@@ -99,6 +99,7 @@ Extrapolated from the measured rates (attention share grows with context): warm 
 | `start_lucebox_docker_qwen36_optimized_prefillcache.sh` | Full configurable Lucebox/Docker launcher. All important runtime knobs are exposed through environment variables. |
 | `start_llamacpp_qwen36_vulkan.sh` | **Recommended for long context:** native llama.cpp (Vulkan release binaries, port 8010) with token-exact KV reuse. Measured numbers in the script header and the update section. |
 | `start_llamacpp_qwen36.sh` | llama.cpp CUDA variant via Docker (untested on the reference machine; the image pull kept failing over IPv6). |
+| `start_llamacpp_qwen36.ps1` | **Windows** PowerShell equivalent of the native llama.cpp launcher (same flags/behavior). Windows even has official CUDA release binaries; extract a win-cuda (plus cudart) or win-vulkan zip into `.\llamacpp-win\`. |
 | `lucebox_warmkeeper.py` | Experimental idle-time cache-refresh proxy for Lucebox. Kept for reference — ineffective against current Lucebox (in-memory snapshot index), see update section. |
 
 ---
@@ -1315,6 +1316,12 @@ Start the llama.cpp long-context alternative (port 8010, recommended for long ag
 
 ```bash
 ./start_llamacpp_qwen36_vulkan.sh
+```
+
+On Windows (native, official win-cuda or win-vulkan release binaries):
+
+```powershell
+.\start_llamacpp_qwen36.ps1
 ```
 
 Install:

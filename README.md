@@ -1,26 +1,23 @@
-# Qwen3.6-35B-A3B on 16 GB VRAM with Lucebox + OpenCode
+# Qwen3.6-35B-A3B on 16 GB VRAM with llama.cpp + OpenCode
 
-A tuned local coding stack for running **Qwen3.6-35B-A3B** on a Linux workstation with an NVIDIA GPU, **16 GB VRAM**, and **64 GB system RAM**. This is rather an example of what can be done using Lucebox than a real world tutorial.
+A tuned local coding stack for running **Qwen3.6-35B-A3B** on a Linux workstation with an NVIDIA GPU, **16 GB VRAM**
 
+---
 
-## Warning: The context window in this setup is really low. You can extend it to 32k at the cost of processing speed.
+# What this setup does
 
-## Qwen3.8 IQ3 M using llama.cpp will most likely perform better both quality- and speedwise, yet allowing a 64k context window. https://huggingface.co/bartowski/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-IQ3_M.gguf
+## Model
 
-The project uses the prebuilt Lucebox CUDA container and the `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` quantization. The main goal is to make a relatively large MoE coding model practical on consumer hardware while keeping OpenCode interactive enough for agentic coding.
+The default model is:
 
-The benchmarked configuration focuses on:
+```text
+unsloth/Qwen3.6-35B-A3B-GGUF
+Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+```
 
-- high single-request decode throughput,
-- aggressive MoE expert offload through **Luce Spark**,
-- **KVFlash** for long-context KV management,
-- small prefill chunks for better TTFT,
-- prefix reuse,
-- no separate Lucebox prefill cache,
-- an aggressively reduced OpenCode system/tool prompt,
-- an OpenAI-compatible local API on `127.0.0.1:8000`.
+Qwen3.6-35B-A3B is a Mixture-of-Experts model. The Q4_K_M GGUF is roughly 22 GB, so the complete model does not fit into 16 GB VRAM by itself.
 
-> **Reference hardware used for the measurements in this README:** 64 GB host RAM and a 16 GB NVIDIA GPU. Exact performance depends heavily on GPU architecture, PCIe bandwidth, driver version, background VRAM usage, prompt length, and Lucebox version.
+Instead of trying to place all weights on the GPU, this project keeps useful/hot MoE experts in VRAM and cold experts in system RAM.
 
 ---
 
@@ -101,25 +98,6 @@ Extrapolated from the measured rates (attention share grows with context): warm 
 | `start_llamacpp_qwen36.sh` | llama.cpp CUDA variant via Docker (untested on the reference machine; the image pull kept failing over IPv6). |
 | `start_llamacpp_qwen36.ps1` | **Windows** PowerShell equivalent of the native llama.cpp launcher (same flags/behavior). Windows even has official CUDA release binaries; extract a win-cuda (plus cudart) or win-vulkan zip into `.\llamacpp-win\`. |
 | `lucebox_warmkeeper.py` | Experimental idle-time cache-refresh proxy for Lucebox. Kept for reference — ineffective against current Lucebox (in-memory snapshot index), see update section. |
-
----
-
-# What this setup does
-
-## Model
-
-The default model is:
-
-```text
-unsloth/Qwen3.6-35B-A3B-GGUF
-Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
-```
-
-Qwen3.6-35B-A3B is a Mixture-of-Experts model. The Q4_K_M GGUF is roughly 22 GB, so the complete model does not fit into 16 GB VRAM by itself.
-
-Instead of trying to place all weights on the GPU, this project uses **Luce Spark** to keep useful/hot MoE experts in VRAM and cold experts in system RAM.
-
----
 
 ## Luce Spark
 

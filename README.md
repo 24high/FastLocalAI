@@ -1,1360 +1,208 @@
 # Qwen3.6-35B-A3B on 16 GB VRAM with llama.cpp + OpenCode
 
-A tuned local coding stack for running **Qwen3.6-35B-A3B** on a Linux workstation with an NVIDIA GPU, **16 GB VRAM**
+A tuned local coding stack for running **Qwen3.6-35B-A3B** on a workstation with an NVIDIA GPU, **16 GB VRAM**, and **64 GB system RAM**, using **llama.cpp** (`llama-server`) with MoE expert offload to system RAM.
+
+Measured on the reference machine (RTX 4080 16 GB, i9-10900KF, Linux, 2026-08-29):
+
+| Metric | Result |
+|---|---|
+| Context window | **131072 tokens (128k)** |
+| Warm TTFT, small follow-up request | **0.7 s** |
+| Warm TTFT, +1.7k-token tool output | **12 s** |
+| Cold prefill | **~144 tok/s** |
+| Decode | **~30 tok/s** |
+
+The key property for agentic coding (OpenCode): `llama-server` keeps the KV cache token-exact per slot, so a follow-up request in a growing session processes **only the new tokens** — warm TTFT depends on the size of the last turn, not on total context length.
+
+> Exact performance depends on GPU architecture, PCIe bandwidth, driver version, background VRAM usage, prompt length, and llama.cpp version.
 
 ---
 
-# What this setup does
-
 ## Model
-
-The default model is:
 
 ```text
 unsloth/Qwen3.6-35B-A3B-GGUF
 Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
 ```
 
-Qwen3.6-35B-A3B is a Mixture-of-Experts model. The Q4_K_M GGUF is roughly 22 GB, so the complete model does not fit into 16 GB VRAM by itself.
+Qwen3.6-35B-A3B is a Mixture-of-Experts model. The Q4_K_M GGUF is roughly 22 GB, so the complete model does not fit into 16 GB VRAM by itself. The launcher keeps attention/dense layers plus a subset of expert layers on the GPU and the remaining experts in system RAM (`--n-cpu-moe`).
 
-Instead of trying to place all weights on the GPU, this project keeps useful/hot MoE experts in VRAM and cold experts in system RAM.
+Alternative worth trying: **Qwen3.8-27B IQ3_M** will most likely perform better both quality- and speed-wise on the same hardware: <https://huggingface.co/bartowski/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-IQ3_M.gguf>
+
+Download the default model with:
+
+```bash
+./models/download_model.sh
+```
 
 ---
 
-# Update 2026-08-29: long context (64k/128k) and a llama.cpp alternative
-
-A deep measurement session on the reference machine (RTX 4080 16 GB, i9-10900KF, 64 GB RAM) produced three major findings. The older sections of this README below are kept for reference, but where they conflict with this section, **this section wins**.
-
-## Finding 1: Lucebox can run 128k context — the real limit was KVFlash, not `--max-ctx`
-
-With `KVFLASH_SIZE=auto`, Lucebox caps the resident KV pool at **16384 tokens** (`caps: speed 16384` in the boot log), regardless of `--max-ctx`. Prompts beyond the pool fail with `context_overflow`. KV costs only **5.6 KiB/token** for this model (GQA + q4_0 family default), so a 128k pool is a mere ~0.7 GiB of VRAM.
-
-The launcher now couples `KVFLASH_SIZE` to `MAX_CTX` automatically, and `run_lucebox.sh` starts a 128k profile:
-
-```bash
-PREFILL_CHUNK=2048 PREFIX_CACHE_SLOTS=32 PREFILL_CACHE_SLOTS=0 \
-MAX_CTX=131072 KVFLASH_SIZE=131072 KV_CACHE_INTERVAL=4096 \
-DEFAULT_MAX_TOKENS=8192 \
-./start_lucebox_docker_qwen36_optimized_prefillcache.sh
-```
-
-Measured cost of 128k vs 64k on an otherwise free GPU: **27.1 vs 28.2 decode tok/s (~4 %)**. New launcher knobs: `KV_CACHE_BUDGET_MB` (default 12288; the old 4 GB disk budget could barely hold one long-context snapshot at ~23 KiB/token), `KV_CACHE_INTERVAL` (default 4096), `KV_CACHE_COLD_MAX` (default 2048), `PPP_LCP_WINDOW` (default 2; maps to the undocumented `DFLASH_PPP_LCP_WINDOW` env of the server).
-
-## Finding 2: Lucebox warm TTFT degrades linearly with session length — and cannot be fixed from outside
-
-Lucebox only restores KV from disk snapshots saved at a "safe" pin boundary. Empirically, that boundary is established once (near the start of a session) and **never advances**: RAM snapshots taken at prompt end are always rejected as `unsafe boundary`, and once a disk hit exists, no new snapshot is saved. Every follow-up request therefore re-prefills everything since the first snapshot at ~90 tok/s (measured: 39 s → 71 s → 108 s for turns growing 2.7k → 6.6k tokens). Deleting the snapshot files does not help — the index lives in server RAM. Neither `PREFILL_CACHE_SLOTS`, larger prefill chunks (1024→2048: 87.5→90.6 tok/s), nor the `DFLASH_PPP_*` pin tuning changes this.
-
-`lucebox_warmkeeper.py` (an idle-time cache-refresh proxy) is included as an experiment; its mechanics work, but it cannot beat the in-memory snapshot index. **Conclusion: with Lucebox, follow-up TTFT under 2 minutes at 64k context is not achievable.**
-
-## Finding 3: llama.cpp solves the TTFT problem outright (recommended for long-context agent work)
-
-The official llama.cpp Vulkan release build (`b10679`, no compilation needed) runs the same GGUF with per-slot, token-exact KV reuse — a follow-up request processes **only the new tokens**. Measured head-to-head on the reference machine:
-
-| Metric | Lucebox | llama.cpp (Vulkan, native) |
-|---|---|---|
-| Warm TTFT, small follow-up | minutes (grows with session) | **0.7 s** |
-| Warm TTFT, +1.7k-token tool output | minutes | **12 s** |
-| Cold prefill | ~90 tok/s | **~144 tok/s** |
-| Decode | ~27 tok/s | **~30 tok/s** |
-
-Start it with:
-
-```bash
-./start_llamacpp_qwen36_vulkan.sh
-```
-
-(API on `127.0.0.1:8010/v1`, same model name; point OpenCode at that URL.) **`--no-op-offload` is mandatory** — without it, llama.cpp copies expert weights over PCIe on every decoded token and decode collapses to ~2 tok/s. With op-offload enabled, prefill reached 364 tok/s but decode was unusable; the CUDA build (`start_llamacpp_qwen36.sh`, Docker) may be able to combine both and is left as a follow-up experiment.
-
-Extrapolated from the measured rates (attention share grows with context): warm TTFT stays at ~1 s (tiny follow-up) to ~15–30 s (+1–2k tokens) even at 64k–128k context; cold prefill ≈ 8–10 min at 64k and ≈ 18–25 min at 128k. Configure client-side compaction to trigger around 30–40k tokens so the occasional full re-prefill stays cheap.
-
----
-
-## Repository layout
+## Repository layout (llama.cpp part)
 
 ```text
 .
-├── install_lucebox_docker_qwen36.sh
-├── lucebox_warmkeeper.py
 ├── models/
 │   ├── download_model.sh
 │   └── Qwen3.6-35B-A3B-UD-Q4_K_M.gguf   # after download
 ├── opencode.jsonc
-├── run_lucebox.sh
-├── start_llamacpp_qwen36.sh
-├── start_llamacpp_qwen36_vulkan.sh
-└── start_lucebox_docker_qwen36_optimized_prefillcache.sh
+├── start_llamacpp_qwen36_vulkan.sh      # Linux, native (recommended)
+├── start_llamacpp_qwen36.ps1            # Windows, native
+└── start_llamacpp_qwen36.sh             # CUDA via Docker (optional)
 ```
-
-### Files
 
 | File | Purpose |
 |---|---|
-| `install_lucebox_docker_qwen36.sh` | Installs/checks Docker, NVIDIA Container Toolkit, pulls the prebuilt Lucebox image, creates a small Hugging Face download environment, and can download the model. |
-| `models/download_model.sh` | Dedicated model download helper. Use it when the model is not already present under `models/`. |
-| `opencode.jsonc` | Minimal OpenCode configuration for the local Lucebox endpoint and a reduced `fastcode` agent. |
-| `run_lucebox.sh` | Convenience launcher for the tuned 128k long-context Lucebox profile (see the 2026-08-29 update section). |
-| `start_lucebox_docker_qwen36_optimized_prefillcache.sh` | Full configurable Lucebox/Docker launcher. All important runtime knobs are exposed through environment variables. |
-| `start_llamacpp_qwen36_vulkan.sh` | **Recommended for long context:** native llama.cpp (Vulkan release binaries, port 8010) with token-exact KV reuse. Measured numbers in the script header and the update section. |
-| `start_llamacpp_qwen36.sh` | llama.cpp CUDA variant via Docker (untested on the reference machine; the image pull kept failing over IPv6). |
-| `start_llamacpp_qwen36.ps1` | **Windows** PowerShell equivalent of the native llama.cpp launcher (same flags/behavior). Windows even has official CUDA release binaries; extract a win-cuda (plus cudart) or win-vulkan zip into `.\llamacpp-win\`. |
-| `lucebox_warmkeeper.py` | Experimental idle-time cache-refresh proxy for Lucebox. Kept for reference — ineffective against current Lucebox (in-memory snapshot index), see update section. |
+| `start_llamacpp_qwen36_vulkan.sh` | **Recommended (Linux):** native `llama-server` from the official Vulkan release binaries, port 8010. No compilation, no Docker. Measured numbers above; details in the script header. |
+| `start_llamacpp_qwen36.ps1` | **Windows** equivalent (same flags/behavior). Windows has official CUDA release binaries; extract a win-cuda (plus cudart) or win-vulkan zip into `.\llamacpp-win\`. |
+| `start_llamacpp_qwen36.sh` | CUDA variant via the `ghcr.io/ggml-org/llama.cpp:server-cuda` Docker image. Untested on the reference machine; may combine the fast-prefill and fast-decode modes (see "op-offload" below). |
+| `models/download_model.sh` | Model download helper. |
+| `opencode.jsonc` | Minimal OpenCode configuration (reduced `fastcode` agent). Adjust the base URL/limits as described below. |
 
-## Luce Spark
-
-Spark is enabled by default:
-
-```text
-ENABLE_SPARK=1
-```
-
-The launcher calculates the Spark VRAM budget dynamically when `SPARK_VRAM_GIB` is not explicitly set.
-
-The calculation is approximately:
-
-```text
-current free VRAM
-- SPARK_VRAM_RESERVE_MIB
-capped at 95% of physical VRAM
-```
-
-Default reserve:
-
-```text
-SPARK_VRAM_RESERVE_MIB=768
-```
-
-The launcher refuses an automatically calculated Spark budget below 8 GiB because that is too small for this model/profile.
-
-This is the main mechanism that makes the ~35B-total-parameter MoE model practical on a 16 GB GPU.
+The remaining `lucebox_*` / `*_lucebox_*` files are legacy from an earlier Lucebox-based iteration of this repository and are kept for reference only; see the git history for their documentation.
 
 ---
 
-## KVFlash
+# Setup
 
-KVFlash is enabled by default:
+## Linux (native, recommended)
 
-```text
-ENABLE_KVFLASH=1
-KVFLASH_SIZE=auto
-KVFLASH_POLICY=qk
-```
+1. Fetch the official llama.cpp release binaries (no compilation):
 
-The purpose is to avoid keeping the entire long-context KV cache permanently resident in VRAM. This is especially useful on a 16 GB card where model expert cache and KV cache compete for the same memory.
+   ```bash
+   mkdir -p llamacpp-b10679 && cd llamacpp-b10679
+   curl -LO https://github.com/ggml-org/llama.cpp/releases/download/b10679/llama-b10679-bin-ubuntu-vulkan-x64.tar.gz
+   tar xzf llama-b10679-bin-ubuntu-vulkan-x64.tar.gz
+   cd ..
+   ```
 
-The `qk` policy is the tuned default for this Qwen3.5/Qwen3.6 path.
+   Vulkan needs a working `libvulkan` + GPU Vulkan driver, which any desktop NVIDIA driver installation provides.
 
----
+2. Download the model if not yet present (`./models/download_model.sh`).
 
-## Prefix cache
+3. Start:
 
-The normal prefix cache is enabled:
+   ```bash
+   ./start_llamacpp_qwen36_vulkan.sh
+   ```
 
-```text
-PREFIX_CACHE_SLOTS=32
-```
+   The server is ready when the log shows `listening on` (~10 s with a warm file cache; the first start after boot takes longer while the 22 GB GGUF is read).
 
-OpenCode requests often share a large common prefix:
+4. Verify:
 
-- system instructions,
-- tool definitions,
-- project rules,
-- earlier conversation turns.
+   ```bash
+   curl http://127.0.0.1:8010/v1/models
+   ```
 
-Reusing these prefixes can reduce repeated work. On this setup the gain is workload-dependent; it helps some coding requests but is not a replacement for reducing the prompt itself.
+Stop with `kill $(cat llamacpp-b10679/server.pid)`; follow logs with `tail -f llamacpp-b10679/server.log`.
 
-Persistent prefix-cache storage is enabled by default:
+## Windows (native)
 
-```text
-PERSIST_PREFIX_CACHE=1
-```
+1. From <https://github.com/ggml-org/llama.cpp/releases> download **either** the CUDA build (`llama-<build>-bin-win-cuda-x64.zip` **plus** the matching `cudart-*.zip`, both extracted into the same folder) **or** the Vulkan build (`llama-<build>-bin-win-vulkan-x64.zip`). Extract into `.\llamacpp-win\`.
+2. Put the GGUF under `.\models\`.
+3. Start:
 
-Host directory:
+   ```powershell
+   .\start_llamacpp_qwen36.ps1
+   ```
 
-```text
-./lucebox-prefix-cache
-```
+Stop with `Stop-Process -Id (Get-Content .\llamacpp-win\server.pid)`; follow logs with `Get-Content -Wait .\llamacpp-win\server.log`.
 
-Container directory:
-
-```text
-/opt/lucebox-hub/cache
-```
-
-The launcher passes it to Lucebox with:
-
-```text
---kv-cache-dir /opt/lucebox-hub/cache
-```
-
----
-
-## Separate prefill cache
-
-The full launcher currently has a conservative/test default of:
-
-```text
-PREFILL_CACHE_SLOTS=8
-```
-
-However, **the benchmarked production profile uses:**
-
-```text
-PREFILL_CACHE_SLOTS=0
-```
-
-A/B testing showed that the separate prefill cache did not consistently improve warm-request TTFT and introduced additional variance. Disabling it produced the best overall results in this setup.
-
-This is intentionally different from the generic launcher's default.
-
----
-
-## Prefill chunk size
-
-The benchmarked profile uses:
-
-```text
-PREFILL_CHUNK=1024
-```
-
-This maps to:
-
-```text
---chunk 1024
-```
-
-Tests with larger chunks, including `2048`, did not improve TTFT on the reference machine.
-
-`1024` currently provides the best measured compromise between prompt ingestion speed and stable decode throughput.
-
----
-
-## Context window
-
-> **Superseded (2026-08-29):** large contexts up to 128k are now practical with Lucebox by setting `KVFLASH_SIZE` alongside `MAX_CTX` (the launcher couples them automatically), at only ~4 % decode cost. The auto-fit/8K advice below predates that finding — see the update section at the top. Note that Lucebox warm TTFT still degrades with session length; for long agent sessions prefer `start_llamacpp_qwen36_vulkan.sh`.
-
-The benchmarked profile leaves:
-
-```text
-MAX_CTX=
-```
-
-empty.
-
-That means Lucebox performs **auto-fit** instead of receiving a forced `--max-ctx`.
-
-On the reference 16 GB setup, auto-fit selected an effective maximum context of:
-
-```text
-8192 tokens
-```
-
-This is intentional.
-
-Forcing a substantially larger maximum context was observed to reduce prefill performance and increase TTFT, even before the additional context was fully used.
-
-For the fastest interactive OpenCode experience, keep `MAX_CTX` empty.
-
-If a larger window is required, it can be forced explicitly:
+## CUDA via Docker (optional)
 
 ```bash
-MAX_CTX=12288 ./start_lucebox_docker_qwen36_optimized_prefillcache.sh
+./start_llamacpp_qwen36.sh
 ```
 
-or:
-
-```bash
-MAX_CTX=16384 ./start_lucebox_docker_qwen36_optimized_prefillcache.sh
-```
-
-Expect worse TTFT. Benchmark the actual workload before making a larger context the default.
+Pulls `ghcr.io/ggml-org/llama.cpp:server-cuda` and runs the same configuration. Untested on the reference machine (the multi-GB image pull kept failing over an unstable IPv6 path there); functionally it should match the native variants, and the CUDA backend is worth benchmarking against Vulkan.
 
 ---
 
-## Output budget
+# Configuration
 
-The full launcher defaults to:
+All launchers are driven by environment variables and share the same defaults:
 
-```text
-DEFAULT_MAX_TOKENS=4096
+| Variable | Default | Description |
+|---|---:|---|
+| `MAX_CTX` | `131072` | Context window. 128k costs ~1.4 GB of q8_0 KV cache. |
+| `N_CPU_MOE` | `28` | Number of MoE layers (of 40) whose experts stay in system RAM. Lower = faster but more VRAM; `28` leaves ~2 GiB free at 128k context on a 16 GB card. Raise it on OOM or when other programs occupy VRAM. |
+| `BATCH` / `UBATCH` | `4096` / `2048` | Prefill batch sizes. |
+| `THREADS` | `8` | CPU threads for the RAM-resident experts. Prefer physical cores. |
+| `CACHE_TYPE_K` / `CACHE_TYPE_V` | `q8_0` | KV cache quantization (halves KV memory vs f16). |
+| `HOST` / `PORT` | `127.0.0.1` / `8010` | API bind address. |
+
+Example:
+
+```bash
+N_CPU_MOE=26 MAX_CTX=65536 ./start_llamacpp_qwen36_vulkan.sh
 ```
 
-The tuned OpenCode profile instead uses:
+## The `--no-op-offload` flag (mandatory)
 
-```text
-DEFAULT_MAX_TOKENS=1024
-```
+All launchers pass `--no-op-offload`. Without it, llama.cpp copies expert weights over PCIe **on every decoded token** and decode collapses to ~2 tok/s. With it, decode runs at ~30 tok/s.
 
-and `opencode.jsonc` declares:
+The trade-off: with op-offload *enabled*, cold prefill reached 364 tok/s (vs 144 tok/s without) — but decode was unusable. If a future llama.cpp version applies op-offload only to large batches, remove the flag and re-benchmark; the CUDA backend may also behave differently here.
 
-```json
-"limit": {
-  "context": 8192,
-  "output": 1024
-}
-```
-
-A smaller default output allowance leaves more usable room inside the 8K context and is sufficient for normal coding-agent turns.
+Other fixed flags: `-ngl 999` (all non-expert layers on GPU), `-np 1` (one slot, the whole KV cache belongs to the single agent session), `--jinja` (tool calling for OpenCode), `-fa on` (flash attention, required for quantized KV).
 
 ---
 
-## PFlash
+# Performance
 
-PFlash support is present in the launcher but disabled by default:
+Measured (9–11k-token prompts, RTX 4080, otherwise idle GPU):
 
-```text
-ENABLE_PFLASH=0
-```
+| Scenario | Result |
+|---|---|
+| Cold prefill, 9.3k-token prompt | 30.6 s wall (**144 tok/s**) |
+| Follow-up, +23 tokens | **0.7 s** (only 23 tokens processed) |
+| Follow-up, +1.7k-token tool output | **12 s** |
+| Decode | **29–31 tok/s** |
 
-Optional parameters:
+Extrapolated to long contexts (attention share grows with position, hence the discounts):
 
-```text
-PFLASH_THRESHOLD=16384
-PFLASH_KEEP_RATIO=0.30
-PFLASH_DRAFTER_FILE=Qwen3-0.6B-BF16.gguf
-```
+| | 64k context | 128k context |
+|---|---|---|
+| Warm TTFT, small follow-up | ~1 s | ~1–2 s |
+| Warm TTFT, +1–2k tokens | ~10–25 s | ~15–30 s |
+| Cold prefill (full context) | ~8–10 min | ~18–25 min |
 
-When enabled, the launcher adds:
-
-```text
---prefill-compression auto
---prefill-threshold <threshold>
---prefill-keep-ratio <ratio>
---prefill-drafter <drafter.gguf>
-```
-
-This project does **not** enable PFlash for the normal OpenCode profile. Coding-agent requests contain tools and structured context where aggressive prompt compression can be undesirable.
-
----
-
-## DFlash speculative decoding
-
-The launcher does not force DFlash speculative decoding for this Qwen3.6-35B-A3B MoE path.
-
-The CUDA sampling environment is still configured with:
-
-```text
-DFLASH_GPU_SAMPLE=1
-DFLASH_GPU_DRAFT_TOPK=1
-DFLASH_GPU_VERIFY_ARGMAX=1
-```
-
-These are passed into the container.
-
----
-
-# Installation
-
-## Requirements
-
-The automatic installer is intended for:
-
-- Linux,
-- Ubuntu or Debian for automatic package installation,
-- an NVIDIA GPU,
-- a working NVIDIA host driver,
-- internet access for Docker packages/image and model download.
-
-Recommended reference system:
-
-```text
-GPU VRAM: 16 GB
-System RAM: 64 GB
-```
-
-The launcher warns when less than roughly 28 GiB host RAM is currently available.
-
-No local Lucebox/CUDA compilation is required.
-
-The prebuilt image is:
-
-```text
-ghcr.io/luce-org/lucebox-hub:cuda12
-```
-
----
-
-## 1. Make the scripts executable
-
-```bash
-chmod +x \
-  install_lucebox_docker_qwen36.sh \
-  run_lucebox.sh \
-  start_lucebox_docker_qwen36_optimized_prefillcache.sh \
-  models/download_model.sh
-```
-
----
-
-## 2. Install Docker, NVIDIA Container Toolkit and Lucebox
-
-The simplest installation path is:
-
-```bash
-./install_lucebox_docker_qwen36.sh
-```
-
-By default the installer:
-
-1. checks for `nvidia-smi`,
-2. installs Docker Engine if necessary,
-3. installs NVIDIA Container Toolkit if necessary,
-4. configures the NVIDIA Docker runtime,
-5. pulls `ghcr.io/luce-org/lucebox-hub:cuda12`,
-6. verifies GPU access from inside the container,
-7. creates `.venv-lucebox-tools`,
-8. installs `huggingface_hub`,
-9. downloads the default GGUF model if it is missing.
-
-The installer does not automatically add your user to the Docker group. If direct Docker access is unavailable, the scripts use `sudo docker` when possible.
-
----
-
-## 3. Download the model
-
-If the installer already downloaded the model, this step is not necessary.
-
-The repository also contains a dedicated downloader:
-
-```bash
-./models/download_model.sh
-```
-
-The expected final path is:
-
-```text
-./models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
-```
-
-If you prefer the dedicated downloader rather than the installer's integrated download:
-
-```bash
-DOWNLOAD_MODEL=0 ./install_lucebox_docker_qwen36.sh
-./models/download_model.sh
-```
-
----
-
-## 4. Start Lucebox
-
-For the tuned profile, use:
-
-```bash
-./run_lucebox.sh
-```
-
-The benchmarked settings are equivalent to:
-
-```bash
-PREFILL_CHUNK=1024 \
-PREFIX_CACHE_SLOTS=32 \
-PREFILL_CACHE_SLOTS=0 \
-MAX_CTX= \
-DEFAULT_MAX_TOKENS=1024 \
-./start_lucebox_docker_qwen36_optimized_prefillcache.sh
-```
-
-The API is exposed only on localhost by default:
-
-```text
-http://127.0.0.1:8000/v1
-```
-
-The served model name is:
-
-```text
-qwen3.6-35b-a3b
-```
-
----
-
-## 5. Verify the server
-
-List models:
-
-```bash
-curl http://127.0.0.1:8000/v1/models
-```
-
-Minimal chat request:
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen3.6-35b-a3b",
-    "messages": [
-      {"role": "user", "content": "Say hello in one sentence."}
-    ],
-    "temperature": 0,
-    "max_tokens": 64
-  }'
-```
-
-Follow logs:
-
-```bash
-docker logs -f lucebox-qwen36
-```
-
-Stop:
-
-```bash
-docker stop lucebox-qwen36
-```
+Cold prefill only happens when the prefix changes: session start, or when the client compacts/rewrites its history. Configure client-side compaction to trigger around **30–40k tokens** so this occasional full re-prefill stays in the few-minutes range.
 
 ---
 
 # OpenCode setup
 
-The repository contains a minimal `opencode.jsonc` designed specifically to reduce prompt overhead.
-
-Install it with:
-
-```bash
-mkdir -p ~/.config/opencode
-
-cp ~/.config/opencode/opencode.jsonc \
-   ~/.config/opencode/opencode.jsonc.backup 2>/dev/null || true
-
-cp ./opencode.jsonc ~/.config/opencode/opencode.jsonc
-```
-
-Then fully restart OpenCode and create a **new session**.
-
-Do not benchmark an old session after changing the configuration; the existing conversation already contains its old accumulated context.
-
----
-
-## Minimal OpenCode agent
-
-The tuned configuration uses:
+Point OpenCode at the llama.cpp endpoint:
 
 ```text
-default_agent = fastcode
+http://127.0.0.1:8010/v1
+model: qwen3.6-35b-a3b
 ```
 
-with a deliberately small primary-agent prompt:
-
-```text
-You are a coding agent. Inspect files before editing. Use tools autonomously.
-Make the smallest correct change, preserve unrelated work, run relevant tests,
-and report results concisely. Never invent repository facts.
-```
-
-The agent denies everything by default and only allows the core coding tools:
-
-```text
-read
-edit
-glob
-grep
-bash
-```
-
-The configuration also disables or removes unnecessary prompt contributors:
+The bundled `opencode.jsonc` provides a reduced `fastcode` agent (minimal system prompt, core tools only: `read`, `edit`, `glob`, `grep`, `bash`). It predates the llama.cpp switch — adjust its base URL to port `8010` and raise the limits, e.g.:
 
 ```json
-"mcp": {},
-"instructions": [],
-"lsp": false,
-"compaction": {
-  "auto": false,
-  "prune": true,
-  "reserved": 1024
+"limit": {
+  "context": 131072,
+  "output": 8192
 }
 ```
 
-This was a major TTFT improvement compared with using OpenCode's much larger default coding-agent prompt/tool set.
-
----
-
-## AGENTS.md / CLAUDE.md
-
-Large project instruction files directly increase prompt size and therefore TTFT.
-
-Keep `AGENTS.md` short. A minimal example is:
-
-```md
-# Project rules
-
-Keep changes minimal and consistent with the existing codebase.
-Use the project's existing build, test, lint, and formatting commands.
-```
-
-Check for global/project rules with:
-
-```bash
-wc -c ~/.config/opencode/AGENTS.md 2>/dev/null
-
-find . -maxdepth 3 \
-  \( -name AGENTS.md -o -name CLAUDE.md \) \
-  -print
-```
-
-If Claude Code compatibility is not needed, OpenCode can be started with:
-
-```bash
-OPENCODE_DISABLE_CLAUDE_CODE=1 opencode
-```
-
-The general rule is simple:
-
-> Every static token that OpenCode sends on every agent step has a direct TTFT cost.
-
-On this hardware, reducing the OpenCode prompt was more valuable than further micro-tuning of decode.
-
----
-
-# Recommended runtime profile
-
-For this specific hardware target, the current recommended profile is:
-
-```text
-Model                  Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
-Spark                  enabled
-Spark VRAM             auto
-Spark reserve          768 MiB
-KVFlash                enabled
-KVFlash size           auto
-KVFlash policy         qk
-MAX_CTX                auto-fit
-Observed auto-fit      8192 tokens
-DEFAULT_MAX_TOKENS     1024
-PREFILL_CHUNK          1024
-PREFIX_CACHE_SLOTS     32
-PREFILL_CACHE_SLOTS    0
-Persistent cache       enabled
-PFlash                 disabled
-DFlash spec decode     not forced
-Temperature            0 recommended
-API                    127.0.0.1:8000/v1
-```
-
-Launch command:
-
-```bash
-PREFILL_CHUNK=1024 \
-PREFIX_CACHE_SLOTS=32 \
-PREFILL_CACHE_SLOTS=0 \
-MAX_CTX= \
-DEFAULT_MAX_TOKENS=1024 \
-./start_lucebox_docker_qwen36_optimized_prefillcache.sh
-```
-
----
-
-# Runtime parameter reference
-
-## Installer parameters
-
-These environment variables are supported by `install_lucebox_docker_qwen36.sh`.
-
-| Variable | Default | Description |
-|---|---|---|
-| `IMAGE` | `ghcr.io/luce-org/lucebox-hub:cuda12` | Prebuilt Lucebox CUDA image. |
-| `MODEL_REPO` | `unsloth/Qwen3.6-35B-A3B-GGUF` | Hugging Face model repository. |
-| `MODEL_FILE` | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | GGUF filename. |
-| `MODELS_DIR` | `./models` | Local model directory. |
-| `TOOLS_VENV` | `./.venv-lucebox-tools` | Small Python environment used for Hugging Face CLI. |
-| `INSTALL_DOCKER` | `1` | Set to `0` to prevent automatic Docker installation. |
-| `INSTALL_NVIDIA_TOOLKIT` | `1` | Set to `0` to prevent automatic NVIDIA Container Toolkit installation. |
-| `PULL_IMAGE` | `1` | Pull the Lucebox image during installation. |
-| `DOWNLOAD_MODEL` | `1` | Download the model during installation. |
-
-Examples:
-
-```bash
-INSTALL_DOCKER=0 ./install_lucebox_docker_qwen36.sh
-```
-
-```bash
-INSTALL_NVIDIA_TOOLKIT=0 ./install_lucebox_docker_qwen36.sh
-```
-
-```bash
-DOWNLOAD_MODEL=0 ./install_lucebox_docker_qwen36.sh
-```
-
-```bash
-PULL_IMAGE=0 ./install_lucebox_docker_qwen36.sh
-```
-
----
-
-## Server/network parameters
-
-| Variable | Launcher default | Description |
-|---|---:|---|
-| `IMAGE` | `ghcr.io/luce-org/lucebox-hub:cuda12` | Lucebox image. |
-| `CONTAINER_NAME` | `lucebox-qwen36` | Docker container name. |
-| `HOST` | `127.0.0.1` | Host address exposed by Docker. |
-| `PORT` | `8000` | Host API port. |
-| `CONTAINER_PORT` | `8080` | Lucebox port inside the container. |
-| `SERVED_NAME` | `qwen3.6-35b-a3b` | OpenAI API model name. |
-| `CUDA_DEVICE` | `0` | GPU used by the launcher when inspecting VRAM with `nvidia-smi`. |
-| `TARGET_DEVICE` | `cuda:0` | Device passed to Lucebox. |
-| `PULL_IMAGE_ON_START` | `0` | Pull the latest configured image before each server start. |
-
-The Docker launcher currently exposes all GPUs with:
-
-```text
---gpus all
-```
-
-On a multi-GPU machine, note that `CUDA_DEVICE` controls the launcher's VRAM inspection while `TARGET_DEVICE` controls the Lucebox target device. Adjust the script/device selection if strict Docker GPU isolation is required.
-
----
-
-## Model parameters
-
-| Variable | Default | Description |
-|---|---|---|
-| `MODEL_FILE` | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | Default GGUF model. |
-| `MODELS_DIR` | `./models` | Host model directory. |
-| `MODEL_PATH` | derived | Full host model path; can be overridden explicitly. |
-
-The host model directory is mounted read/write into:
-
-```text
-/opt/lucebox-hub/server/models
-```
-
-Read/write access allows Lucebox/Spark to persist placement data next to the model when applicable.
-
----
-
-## Context and generation parameters
-
-| Variable | Launcher default | Tuned profile | Description |
-|---|---:|---:|---|
-| `MAX_CTX` | empty | empty | Empty means Lucebox auto-fit. |
-| `DEFAULT_MAX_TOKENS` | `4096` | `1024` | Default generation limit when the client does not override it. |
-| `PREFILL_CHUNK` | empty | `1024` | Optional prefill chunk/ubatch size. |
-
-A fixed context is passed as:
-
-```text
---max-ctx <MAX_CTX>
-```
-
-A prefill chunk is passed as:
-
-```text
---chunk <PREFILL_CHUNK>
-```
-
-### Why auto-fit is preferred
-
-On the reference machine, auto-fit produced an 8192-token maximum context and the best TTFT.
-
-Larger fixed contexts worked but reduced prefill performance. If 8K is sufficient for the workload, leave `MAX_CTX` empty.
-
----
-
-## Prefix/prefill cache parameters
-
-| Variable | Launcher default | Tuned profile | Description |
-|---|---:|---:|---|
-| `PREFIX_CACHE_SLOTS` | `32` | `32` | Normal prefix-cache slots. |
-| `PREFILL_CACHE_SLOTS` | `8` | `0` | Separate prefill cache. Disabled in the best measured profile. |
-| `PERSIST_PREFIX_CACHE` | `1` | `1` | Persist cache across container restarts. |
-| `PREFIX_CACHE_HOST_DIR` | `./lucebox-prefix-cache` | same | Host cache directory. |
-
----
-
-## Spark parameters
-
-| Variable | Default | Description |
-|---|---:|---|
-| `ENABLE_SPARK` | `1` | Enable Luce Spark. |
-| `SPARK_VRAM_GIB` | empty/auto | Explicit Spark VRAM budget. Empty triggers dynamic calculation. |
-| `SPARK_VRAM_RESERVE_MIB` | `768` | VRAM kept outside the automatically calculated Spark budget. |
-
-Example:
-
-```bash
-SPARK_VRAM_GIB=13.5 ./start_lucebox_docker_qwen36_optimized_prefillcache.sh
-```
-
-Auto-calculation never intentionally exceeds approximately 95% of total physical VRAM.
-
----
-
-## KVFlash parameters
-
-| Variable | Default | Description |
-|---|---|---|
-| `ENABLE_KVFLASH` | `1` | Enable KVFlash. |
-| `KVFLASH_SIZE` | `auto` | KVFlash size. |
-| `KVFLASH_POLICY` | `qk` | KVFlash policy. |
-
-Alternative experiment:
-
-```bash
-KVFLASH_POLICY=lru ./start_lucebox_docker_qwen36_optimized_prefillcache.sh
-```
-
-The benchmarked profile uses `qk`.
-
----
-
-## PFlash parameters
-
-| Variable | Default | Description |
-|---|---:|---|
-| `ENABLE_PFLASH` | `0` | Enable optional prefill compression. |
-| `PFLASH_THRESHOLD` | `16384` | Prompt threshold before compression. |
-| `PFLASH_KEEP_RATIO` | `0.30` | Fraction of prompt information retained by the configured compression path. |
-| `PFLASH_DRAFTER_FILE` | `Qwen3-0.6B-BF16.gguf` | PFlash drafter model filename. |
-
-The launcher refuses to start with PFlash enabled if the configured drafter model is missing.
-
----
-
-## GPU sampling parameters
-
-| Variable | Default |
-|---|---:|
-| `DFLASH_GPU_SAMPLE` | `1` |
-| `DFLASH_GPU_DRAFT_TOPK` | `1` |
-| `DFLASH_GPU_VERIFY_ARGMAX` | `1` |
-
-These are exported into the Docker container.
-
----
-
-## Cleanup parameters
-
-| Variable | Default | Description |
-|---|---|---|
-| `DELETE_OLD_MODEL` | `1` | Remove a specifically configured old Hugging Face model cache at startup. |
-| `OLD_MODEL_ID` | `cyankiwi/Qwen3-Coder-Next-AWQ-4bit` | Old model cache ID targeted by the cleanup. |
-
-If you do not want the launcher to touch this old cache:
-
-```bash
-DELETE_OLD_MODEL=0 ./run_lucebox.sh
-```
-
-The script only deletes the matching Hugging Face cache path and contains a path-safety check before removal.
-
----
-
-## CLI options
-
-The server launcher recognizes:
-
-```text
---foreground
-```
-
-This starts the container in the foreground and uses Docker `--rm`.
-
-Example:
-
-```bash
-./start_lucebox_docker_qwen36_optimized_prefillcache.sh --foreground
-```
-
-Any other command-line arguments are appended to the native Lucebox server command, which allows additional Lucebox flags to be tested without editing the script.
-
----
-
-# Benchmarks
-
-## Benchmark definitions
-
-The measurements below distinguish:
-
-- **TTFT** — time to the first meaningful content/reasoning/tool-call delta,
-- **prompt** — prompt tokens reported by the server,
-- **effective prefill** — `prompt_tokens / TTFT`,
-- **decode TPS** — completion tokens divided by decode time after TTFT,
-- **total** — complete request duration.
-
-The synthetic OpenCode benchmark uses realistic system instructions, coding context and tool definitions. It is useful for A/B testing, but the real OpenCode prompt can still be larger depending on project instructions and conversation history.
-
----
-
-## Final tuned profile: coding and tool follow-up
-
-Configuration:
-
-```text
-PREFILL_CHUNK=1024
-PREFIX_CACHE_SLOTS=32
-PREFILL_CACHE_SLOTS=0
-MAX_CTX=auto-fit / observed 8192
-DEFAULT_MAX_TOKENS=1024
-```
-
-### Coding
-
-| Run | Cache | Prompt | TTFT | Effective prefill | Generated | Decode |
-|---|---|---:|---:|---:|---:|---:|
-| 1 | cold | 1734 | 8.704 s | 199.2 tok/s | 67 | 54.33 tok/s |
-| 1 | warm | 1734 | 7.521 s | 230.6 tok/s | 66 | 53.02 tok/s |
-| 2 | cold | 1735 | 8.325 s | 208.4 tok/s | 98 | 53.34 tok/s |
-| 2 | warm | 1735 | 7.993 s | 217.1 tok/s | 97 | 53.12 tok/s |
-
-Approximate coding averages:
-
-```text
-Cold TTFT:       8.51 s
-Warm TTFT:       7.76 s
-Cold prefill:  ~203.8 tok/s
-Warm prefill:  ~223.9 tok/s
-Decode:        ~53-54 tok/s
-```
-
-### Tool follow-up
-
-| Run | Cache | Prompt | TTFT | Effective prefill | Generated | Decode |
-|---|---|---:|---:|---:|---:|---:|
-| 1 | cold | 2508 | 12.926 s | 194.0 tok/s | 75 | 52.66 tok/s |
-| 1 | warm | 2508 | 12.962 s | 193.5 tok/s | 75 | 53.76 tok/s |
-| 2 | cold | 2506 | 13.661 s | 183.4 tok/s | 75 | 52.85 tok/s |
-
-The key result is that disabling the separate prefill cache preserved or improved TTFT while decode remained above roughly 52 tok/s.
-
----
-
-## Larger OpenCode-like prompts
-
-Benchmark command:
-
-```bash
-./benchmark_opencode_lucebox.py \
-  --runs 2 \
-  --scenarios tool_followup,long_session \
-  --context-scale 2.5 \
-  --max-tokens 256
-```
-
-### Tool follow-up
-
-| Run | Cache | Prompt | TTFT | Effective prefill | Decode |
-|---|---|---:|---:|---:|---:|
-| 1 | cold | 2908 | 19.371 s | 150.1 tok/s | 53.85 tok/s |
-| 1 | warm | 2908 | 17.117 s | 169.9 tok/s | 52.08 tok/s |
-| 2 | cold | 2905 | 16.659 s | 174.4 tok/s | 54.24 tok/s |
-| 2 | warm | 2905 | 16.472 s | 176.4 tok/s | 53.20 tok/s |
-
-### Long session
-
-| Run | Cache | Prompt | TTFT | Effective prefill | Decode |
-|---|---|---:|---:|---:|---:|
-| 1 | cold | 3378 | 20.581 s | 164.1 tok/s | 53.46 tok/s |
-| 1 | warm | 3378 | 19.366 s | 174.4 tok/s | 51.97 tok/s |
-| 2 | cold | 3377 | 19.305 s | 174.9 tok/s | 52.45 tok/s |
-
-These results show the main characteristic of the setup:
-
-> **Decode throughput remains excellent while TTFT is dominated by prompt length.**
-
----
-
-## Earlier end-to-end Lucebox results
-
-Before the final prompt/cache tuning, the same model already showed strong decode performance:
-
-| Scenario | Prompt | TTFT | Effective prefill | Generated | Decode |
-|---|---:|---:|---:|---:|---:|
-| Short | 36 | 0.428 s | 84.1 tok/s | 15 | 60.73 tok/s |
-| Coding | 80 | 0.763 s | 104.9 tok/s | 317 | 38.79 tok/s |
-| Long prompt | 2262 | 22.626 s | 100.0 tok/s | 800 | 43.94 tok/s |
-| Tool call | 323 | 3.557 s | 90.8 tok/s | 40 | 36.18 tok/s |
-
-The later tuning increased coding/tool decode throughput into the ~52-54 tok/s range and substantially improved prefill throughput on moderate prompts.
-
----
-
-# What the benchmarks taught us
-
-## 1. Prompt size is the main OpenCode bottleneck
-
-The original OpenCode setup could send roughly 7K+ prompt tokens for a simple agent step.
-
-At approximately 160-220 prompt tokens/s, large static prompts naturally produce tens of seconds of TTFT.
-
-Reducing the OpenCode system prompt, tool schema set, MCPs, project rules and other static context had a larger impact than further decode tuning.
-
----
-
-## 2. Decode is no longer the main problem
-
-With the tuned profile:
-
-```text
-~52-54 decode tok/s
-```
-
-is typical for the tested coding/tool workloads.
-
-That is already above the original target of roughly 40 output tok/s.
-
----
-
-## 3. `PREFILL_CHUNK=1024` is the current sweet spot
-
-A larger `2048` chunk did not improve TTFT on the reference system.
-
-The final profile therefore uses:
-
-```text
-PREFILL_CHUNK=1024
-```
-
----
-
-## 4. Separate prefill cache should stay off
-
-Testing:
-
-```text
-PREFILL_CACHE_SLOTS=8
-```
-
-against:
-
-```text
-PREFILL_CACHE_SLOTS=0
-```
-
-showed no consistent warm-cache advantage for the separate prefill cache. The zero-slot configuration was faster and/or less variable in the important coding tests.
-
-Keep:
-
-```text
-PREFILL_CACHE_SLOTS=0
-```
-
-unless a future Lucebox version changes the behavior.
-
----
-
-## 5. The normal prefix cache is still useful
-
-Keep:
-
-```text
-PREFIX_CACHE_SLOTS=32
-```
-
-Some repeated coding requests improved meaningfully, while others were nearly neutral. The memory/performance tradeoff is acceptable on the reference system.
-
----
-
-## 6. Do not oversize context unless necessary
-
-The fastest configuration uses auto-fit, resulting in an 8K context on the reference machine.
-
-A larger fixed context can be useful when longer sessions are more important than latency, but it should be treated as a separate profile rather than a free upgrade.
-
----
-
-# Suggested profiles
-
-## Fast / interactive OpenCode
-
-```bash
-PREFILL_CHUNK=1024 \
-PREFIX_CACHE_SLOTS=32 \
-PREFILL_CACHE_SLOTS=0 \
-MAX_CTX= \
-DEFAULT_MAX_TOKENS=1024 \
-./start_lucebox_docker_qwen36_optimized_prefillcache.sh
-```
-
-Recommended default.
-
----
-
-## 12K context experiment
-
-```bash
-PREFILL_CHUNK=1024 \
-PREFIX_CACHE_SLOTS=32 \
-PREFILL_CACHE_SLOTS=0 \
-MAX_CTX=12288 \
-DEFAULT_MAX_TOKENS=1024 \
-./start_lucebox_docker_qwen36_optimized_prefillcache.sh
-```
-
-Use only if 8K becomes restrictive. Expect higher TTFT.
-
-This profile has **not** been included in the measured benchmark tables above unless you benchmark it separately on your machine.
-
----
-
-## Generic launcher defaults
-
-Running the full launcher without overrides:
-
-```bash
-./start_lucebox_docker_qwen36_optimized_prefillcache.sh
-```
-
-uses its built-in defaults, including:
-
-```text
-DEFAULT_MAX_TOKENS=4096
-PREFIX_CACHE_SLOTS=32
-PREFILL_CACHE_SLOTS=8
-PREFILL_CHUNK=<backend default>
-MAX_CTX=<auto-fit>
-```
-
-Those are **not** the final benchmarked production settings. Use `run_lucebox.sh` or the explicit tuned command for the optimized OpenCode profile.
+General prompt-size advice still applies: every static token (system prompt, tool schemas, `AGENTS.md`, MCP servers) is paid once per session at ~144 tok/s and then cached. Keep project instruction files short. TTFT and decode TPS are separate performance problems — with per-slot KV reuse, prompt size mostly affects the *first* request of a session.
 
 ---
 
 # Troubleshooting
 
-## Docker cannot access the GPU
+**Decode is ~2 tok/s** — `--no-op-offload` is missing. All launchers in this repo set it; if you run `llama-server` manually, add it.
 
-Check the host first:
+**Out of memory on startup or under load** — raise `N_CPU_MOE` (e.g. 30–32), lower `MAX_CTX`, or free VRAM (browsers, games, VMs). Every GB another program holds costs performance.
 
-```bash
-nvidia-smi
-```
+**Warm requests suddenly prefill everything again** — the request prefix changed (client compacted/rewrote history, or a different session hit the single slot). This costs one cold prefill and then re-caches.
 
-Then verify Docker:
-
-```bash
-docker run --rm --gpus all \
-  ghcr.io/luce-org/lucebox-hub:cuda12 \
-  nvidia-smi
-```
-
-If necessary, rerun:
-
-```bash
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-```
-
----
-
-## Model not found
-
-Expected file:
-
-```text
-models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
-```
-
-Run:
-
-```bash
-./models/download_model.sh
-```
-
-or rerun the installer with model download enabled:
-
-```bash
-DOWNLOAD_MODEL=1 ./install_lucebox_docker_qwen36.sh
-```
-
----
-
-## Container already exists/runs
-
-Check:
-
-```bash
-docker ps -a --filter name=lucebox-qwen36
-```
-
-Stop it:
-
-```bash
-docker stop lucebox-qwen36
-```
-
-The launcher automatically removes an old **stopped** container with the configured name, but deliberately refuses to replace one that is still running.
-
----
-
-## OpenCode context-length errors
-
-Make sure OpenCode and Lucebox agree.
-
-For the fastest profile:
-
-```json
-"limit": {
-  "context": 8192,
-  "output": 1024
-}
-```
-
-and leave:
-
-```text
-MAX_CTX=
-```
-
-for server auto-fit.
-
-If a request plus output allowance exceeds the server context, reduce conversation/project prompt size, create a new session, reduce output allowance, or intentionally move to a larger server context profile.
-
----
-
-## OpenCode is still slow on the first token
-
-Check the actual prompt size.
-
-The server can decode above 50 tok/s while still taking a long time before the first token if OpenCode sends several thousand prompt tokens.
-
-Review:
-
-- `AGENTS.md`,
-- `CLAUDE.md`,
-- global OpenCode instructions,
-- enabled tools,
-- MCP servers,
-- old conversation history,
-- large pasted files,
-- unnecessary project rules.
-
-TTFT and decode TPS are separate performance problems.
-
----
-
-## Inspect cache behavior
-
-```bash
-docker logs lucebox-qwen36 2>&1 \
-  | grep -Ei 'prefix|prefill|cache|hit|restore'
-```
-
-Do not assume a configured cache is helping. Measure cold/warm pairs.
+**Server won't start / no Vulkan device** — check `vulkaninfo` (Linux) or use the win-cuda build (Windows).
 
 ---
 
 # Security
 
-By default, Docker publishes the API as:
-
-```text
-127.0.0.1:8000
-```
-
-so it is not exposed to other network hosts.
-
-Be careful when changing:
-
-```text
-HOST=0.0.0.0
-```
-
-because the OpenAI-compatible endpoint has no authentication layer configured by these scripts.
-
-The OpenCode agent also has `bash` access, so it can execute shell commands with the permissions of the user running OpenCode.
-
----
-
-# Updating
-
-To pull the currently configured Lucebox image manually:
-
-```bash
-docker pull ghcr.io/luce-org/lucebox-hub:cuda12
-```
-
-or start once with:
-
-```bash
-PULL_IMAGE_ON_START=1 ./run_lucebox.sh
-```
-
-Because Lucebox is under active development, rerun the benchmark suite after changing the container image. Cache behavior, context auto-fit, memory usage and throughput may change between versions.
-
----
-
-# Design priorities
-
-This repository intentionally optimizes for:
-
-1. **agentic local coding** rather than maximum benchmark context,
-2. **low TTFT** rather than unnecessarily large reserved context,
-3. **stable ~50+ tok/s decode** on the reference setup,
-4. **16 GB VRAM practicality** through MoE expert placement/offload,
-5. **minimal OpenCode prompt overhead**,
-6. reproducible, environment-variable-driven tuning.
-
-The resulting stack is not intended to maximize every metric simultaneously. It is a practical latency/quality/memory compromise for running a capable Qwen3.6 coding agent locally on hardware that cannot keep the full model in VRAM.
-
----
-
-# Quick reference
-
-Start the llama.cpp long-context alternative (port 8010, recommended for long agent sessions):
-
-```bash
-./start_llamacpp_qwen36_vulkan.sh
-```
-
-On Windows (native, official win-cuda or win-vulkan release binaries):
-
-```powershell
-.\start_llamacpp_qwen36.ps1
-```
-
-Install:
-
-```bash
-./install_lucebox_docker_qwen36.sh
-```
-
-Download model if needed:
-
-```bash
-./models/download_model.sh
-```
-
-Install OpenCode config:
-
-```bash
-mkdir -p ~/.config/opencode
-cp ./opencode.jsonc ~/.config/opencode/opencode.jsonc
-```
-
-Start the tuned server:
-
-```bash
-./run_lucebox.sh
-```
-
-Check API:
-
-```bash
-curl http://127.0.0.1:8000/v1/models
-```
-
-Logs:
-
-```bash
-docker logs -f lucebox-qwen36
-```
-
-Stop:
-
-```bash
-docker stop lucebox-qwen36
-```
-
-Recommended core tuning:
-
-```text
-PREFILL_CHUNK=1024
-PREFIX_CACHE_SLOTS=32
-PREFILL_CACHE_SLOTS=0
-MAX_CTX=auto-fit
-DEFAULT_MAX_TOKENS=1024
-KVFlash=auto/qk
-Spark=enabled
-OpenCode context=8192
-OpenCode output=1024
-```
+The API binds to `127.0.0.1` by default and has **no authentication**. Be careful with `HOST=0.0.0.0`. An OpenCode agent with `bash` access executes shell commands with your user's permissions.

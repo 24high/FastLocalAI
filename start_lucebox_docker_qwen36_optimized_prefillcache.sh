@@ -73,7 +73,23 @@ TARGET_DEVICE="${TARGET_DEVICE:-cuda:0}"
 # --max-ctx kann den Prefill deutlich bremsen.
 #
 # Nur setzen, wenn du bewusst einen festen Context erzwingen willst:
-#   MAX_CTX=16384 ./start_lucebox_docker_qwen36_optimized.sh
+#   MAX_CTX=131072 ./start_lucebox_docker_qwen36_optimized.sh
+#
+# ACHTUNG: MAX_CTX allein reicht NICHT fuer lange Kontexte!
+# Bei KVFLASH_SIZE=auto deckelt Lucebox den residenten KV-Pool aus
+# Speed-Gruenden hart bei 16384 Tokens ("caps: speed 16384") -- Requests
+# oberhalb davon scheitern dann mit context_overflow, egal wie gross
+# --max-ctx ist. Dieses Script koppelt deshalb weiter unten KVFLASH_SIZE
+# automatisch an MAX_CTX, sofern KVFLASH_SIZE nicht explizit gesetzt ist.
+#
+# VRAM-Kosten des KV-Pools bei Qwen3.6-35B-A3B: nur 5.6 KiB/Token
+# (GQA + q4_0 KV-Quant als Family-Default):
+#   32k  ->  ~180 MiB
+#   64k  ->  ~360 MiB
+#   128k ->  ~720 MiB
+# Der Spark-Expert-Cache schrumpft entsprechend (Placement rechnet den
+# Pool automatisch ein) -- bei 128k ca. 4.9 -> 4.3 GiB Hot-Experts,
+# also nur wenige Prozent Decode-TPS.
 MAX_CTX="${MAX_CTX:-}"
 
 # 4096 ist fuer Coding meist ausreichend und vermeidet ein unnötig grosses
@@ -99,6 +115,45 @@ PERSIST_PREFIX_CACHE="${PERSIST_PREFIX_CACHE:-1}"
 PREFIX_CACHE_HOST_DIR="${PREFIX_CACHE_HOST_DIR:-$BASE_DIR/lucebox-prefix-cache}"
 PREFIX_CACHE_CONTAINER_DIR="/opt/lucebox-hub/cache"
 
+# Disk-Budget fuer den persistenten KV-Cache. Der Server-Default (4096 MB)
+# ist fuer lange Kontexte zu klein: ein Snapshot kostet ~23 KiB/Token auf
+# Platte, ein 128k-Snapshot also ~2.9 GB -- da passt in 4 GB kaum einer
+# rein und der Cache thrashed. 12 GB halten ca. 4 grosse Snapshots.
+KV_CACHE_BUDGET_MB="${KV_CACHE_BUDGET_MB:-12288}"
+
+# Prefix-Pin-Fenster (Server-Default: 8, undokumentierter Env-Schalter
+# DFLASH_PPP_LCP_WINDOW). Der restorebare Prefix ("Pin") ist der laengste
+# gemeinsame Prefix der letzten N Requests -- bei N=8 hinkt der Restore-
+# Punkt der Konversation also ~8 Requests hinterher, und genau dieser
+# Rueckstand muss bei jedem Folgerequest neu prefilled werden (bei ~90
+# tok/s schnell mehrere Minuten). N=2 heisst: Pin = gemeinsamer Prefix
+# mit dem VORHERIGEN Request, d.h. bei einer wachsenden Agenten-Session
+# wird nur noch der letzte Turn neu prefilled.
+# Trade-off: Laufen mehrere Sessions gleichzeitig gegen den Server,
+# kollabiert der Pin bei kleinem N haeufiger -> dann eher 4 nehmen.
+PPP_LCP_WINDOW="${PPP_LCP_WINDOW:-2}"
+
+# Ab welcher Promptlaenge der Disk-Cache einen restorebaren Snapshot an
+# der Pin-Grenze anlegt (Server-Default: 10240). Nur DIESE Snapshots sind
+# ueber Requests hinweg restorebar -- die RAM-Snapshots am Prompt-Ende
+# scheitern immer an "unsafe boundary" (Template-Grenze). Mit 2048 legt
+# praktisch jeder Agenten-Request einen Snapshot an und der Folgerequest
+# kann direkt hinter dem letzten Turn weitermachen.
+# Kosten: ~23 KiB/Token Schreibvolumen pro Snapshot auf NVMe.
+KV_CACHE_COLD_MAX="${KV_CACHE_COLD_MAX:-2048}"
+
+# Checkpoint-Intervall des Disk-KV-Caches (Server-Default: 10240).
+# Bestimmt die WORST-CASE-TTFT im Warm-Pfad: nach einem Restore muss
+# hoechstens (Intervall + neuer Suffix) cold prefilled werden. Prefill
+# schafft auf der RTX 4080 ~90 tok/s (Experten-Streaming-gebunden,
+# Chunk-Groesse aendert daran fast nichts):
+#   Intervall 10240 -> worst case ~115 s nur fuers Aufholen
+#   Intervall  4096 -> worst case  ~45 s
+# 4096 haelt damit typische Folgerequests auch bei 64k+ Gesamtkontext
+# unter 2 Minuten TTFT. Cold-Prefill eines KOMPLETT neuen langen Prompts
+# bleibt davon unberuehrt (64k cold ~= 12 min -- das ist Hardware-Limit).
+KV_CACHE_INTERVAL="${KV_CACHE_INTERVAL:-4096}"
+
 # Prefill-Ubatch nicht erzwingen; der Lucebox-Backend-Default ist der
 # Ausgangspunkt. Fuer A/B-Tests z.B. PREFILL_CHUNK=1024 oder 2048 setzen.
 PREFILL_CHUNK="${PREFILL_CHUNK:-}"
@@ -120,6 +175,14 @@ SPARK_VRAM_RESERVE_MIB="${SPARK_VRAM_RESERVE_MIB:-768}"
 ENABLE_KVFLASH="${ENABLE_KVFLASH:-1}"
 KVFLASH_SIZE="${KVFLASH_SIZE:-auto}"
 KVFLASH_POLICY="${KVFLASH_POLICY:-qk}"
+
+# KVFlash-Pool an MAX_CTX koppeln: "auto" wuerde den Pool bei 16384 Tokens
+# deckeln und lange Prompts mit context_overflow abweisen (der Server
+# verlangt beim Hybrid-Restore Pool >= Promptlaenge). Explizit gesetztes
+# KVFLASH_SIZE hat weiterhin Vorrang.
+if [[ "$KVFLASH_SIZE" == "auto" && -n "$MAX_CTX" ]]; then
+    KVFLASH_SIZE="$MAX_CTX"
+fi
 
 # GPU Sampling ist im CUDA-Server standardmaessig aktiv. Explizit setzen.
 DFLASH_GPU_SAMPLE="${DFLASH_GPU_SAMPLE:-1}"
@@ -333,6 +396,7 @@ DOCKER_ARGS=(
     -e "DFLASH_GPU_SAMPLE=$DFLASH_GPU_SAMPLE"
     -e "DFLASH_GPU_DRAFT_TOPK=$DFLASH_GPU_DRAFT_TOPK"
     -e "DFLASH_GPU_VERIFY_ARGMAX=$DFLASH_GPU_VERIFY_ARGMAX"
+    -e "DFLASH_PPP_LCP_WINDOW=$PPP_LCP_WINDOW"
 
     "$IMAGE"
 
@@ -379,6 +443,9 @@ if [[ "$PERSIST_PREFIX_CACHE" == "1" ]]; then
 
     DOCKER_ARGS+=(
         --kv-cache-dir "$PREFIX_CACHE_CONTAINER_DIR"
+        --kv-cache-budget "$KV_CACHE_BUDGET_MB"
+        --kv-cache-interval "$KV_CACHE_INTERVAL"
+        --kv-cache-cold-max "$KV_CACHE_COLD_MAX"
     )
 fi
 
@@ -454,6 +521,8 @@ echo "  PREFILL_CACHE_SLOTS   = $PREFILL_CACHE_SLOTS"
 echo "  PERSIST_PREFIX_CACHE  = $PERSIST_PREFIX_CACHE"
 if [[ "$PERSIST_PREFIX_CACHE" == "1" ]]; then
     echo "  CACHE_DIR             = $PREFIX_CACHE_HOST_DIR"
+    echo "  KV_CACHE_BUDGET_MB    = $KV_CACHE_BUDGET_MB"
+    echo "  KV_CACHE_INTERVAL     = $KV_CACHE_INTERVAL"
 fi
 echo
 echo "PFlash:"

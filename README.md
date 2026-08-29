@@ -24,16 +24,67 @@ The benchmarked configuration focuses on:
 
 ---
 
+# Update 2026-08-29: long context (64k/128k) and a llama.cpp alternative
+
+A deep measurement session on the reference machine (RTX 4080 16 GB, i9-10900KF, 64 GB RAM) produced three major findings. The older sections of this README below are kept for reference, but where they conflict with this section, **this section wins**.
+
+## Finding 1: Lucebox can run 128k context — the real limit was KVFlash, not `--max-ctx`
+
+With `KVFLASH_SIZE=auto`, Lucebox caps the resident KV pool at **16384 tokens** (`caps: speed 16384` in the boot log), regardless of `--max-ctx`. Prompts beyond the pool fail with `context_overflow`. KV costs only **5.6 KiB/token** for this model (GQA + q4_0 family default), so a 128k pool is a mere ~0.7 GiB of VRAM.
+
+The launcher now couples `KVFLASH_SIZE` to `MAX_CTX` automatically, and `run_lucebox.sh` starts a 128k profile:
+
+```bash
+PREFILL_CHUNK=2048 PREFIX_CACHE_SLOTS=32 PREFILL_CACHE_SLOTS=0 \
+MAX_CTX=131072 KVFLASH_SIZE=131072 KV_CACHE_INTERVAL=4096 \
+DEFAULT_MAX_TOKENS=8192 \
+./start_lucebox_docker_qwen36_optimized_prefillcache.sh
+```
+
+Measured cost of 128k vs 64k on an otherwise free GPU: **27.1 vs 28.2 decode tok/s (~4 %)**. New launcher knobs: `KV_CACHE_BUDGET_MB` (default 12288; the old 4 GB disk budget could barely hold one long-context snapshot at ~23 KiB/token), `KV_CACHE_INTERVAL` (default 4096), `KV_CACHE_COLD_MAX` (default 2048), `PPP_LCP_WINDOW` (default 2; maps to the undocumented `DFLASH_PPP_LCP_WINDOW` env of the server).
+
+## Finding 2: Lucebox warm TTFT degrades linearly with session length — and cannot be fixed from outside
+
+Lucebox only restores KV from disk snapshots saved at a "safe" pin boundary. Empirically, that boundary is established once (near the start of a session) and **never advances**: RAM snapshots taken at prompt end are always rejected as `unsafe boundary`, and once a disk hit exists, no new snapshot is saved. Every follow-up request therefore re-prefills everything since the first snapshot at ~90 tok/s (measured: 39 s → 71 s → 108 s for turns growing 2.7k → 6.6k tokens). Deleting the snapshot files does not help — the index lives in server RAM. Neither `PREFILL_CACHE_SLOTS`, larger prefill chunks (1024→2048: 87.5→90.6 tok/s), nor the `DFLASH_PPP_*` pin tuning changes this.
+
+`lucebox_warmkeeper.py` (an idle-time cache-refresh proxy) is included as an experiment; its mechanics work, but it cannot beat the in-memory snapshot index. **Conclusion: with Lucebox, follow-up TTFT under 2 minutes at 64k context is not achievable.**
+
+## Finding 3: llama.cpp solves the TTFT problem outright (recommended for long-context agent work)
+
+The official llama.cpp Vulkan release build (`b10679`, no compilation needed) runs the same GGUF with per-slot, token-exact KV reuse — a follow-up request processes **only the new tokens**. Measured head-to-head on the reference machine:
+
+| Metric | Lucebox | llama.cpp (Vulkan, native) |
+|---|---|---|
+| Warm TTFT, small follow-up | minutes (grows with session) | **0.7 s** |
+| Warm TTFT, +1.7k-token tool output | minutes | **12 s** |
+| Cold prefill | ~90 tok/s | **~144 tok/s** |
+| Decode | ~27 tok/s | **~30 tok/s** |
+
+Start it with:
+
+```bash
+./start_llamacpp_qwen36_vulkan.sh
+```
+
+(API on `127.0.0.1:8010/v1`, same model name; point OpenCode at that URL.) **`--no-op-offload` is mandatory** — without it, llama.cpp copies expert weights over PCIe on every decoded token and decode collapses to ~2 tok/s. With op-offload enabled, prefill reached 364 tok/s but decode was unusable; the CUDA build (`start_llamacpp_qwen36.sh`, Docker) may be able to combine both and is left as a follow-up experiment.
+
+Extrapolated from the measured rates (attention share grows with context): warm TTFT stays at ~1 s (tiny follow-up) to ~15–30 s (+1–2k tokens) even at 64k–128k context; cold prefill ≈ 8–10 min at 64k and ≈ 18–25 min at 128k. Configure client-side compaction to trigger around 30–40k tokens so the occasional full re-prefill stays cheap.
+
+---
+
 ## Repository layout
 
 ```text
 .
 ├── install_lucebox_docker_qwen36.sh
+├── lucebox_warmkeeper.py
 ├── models/
 │   ├── download_model.sh
 │   └── Qwen3.6-35B-A3B-UD-Q4_K_M.gguf   # after download
 ├── opencode.jsonc
 ├── run_lucebox.sh
+├── start_llamacpp_qwen36.sh
+├── start_llamacpp_qwen36_vulkan.sh
 └── start_lucebox_docker_qwen36_optimized_prefillcache.sh
 ```
 
@@ -44,8 +95,11 @@ The benchmarked configuration focuses on:
 | `install_lucebox_docker_qwen36.sh` | Installs/checks Docker, NVIDIA Container Toolkit, pulls the prebuilt Lucebox image, creates a small Hugging Face download environment, and can download the model. |
 | `models/download_model.sh` | Dedicated model download helper. Use it when the model is not already present under `models/`. |
 | `opencode.jsonc` | Minimal OpenCode configuration for the local Lucebox endpoint and a reduced `fastcode` agent. |
-| `run_lucebox.sh` | Convenience launcher for the benchmarked/tuned runtime profile. |
+| `run_lucebox.sh` | Convenience launcher for the tuned 128k long-context Lucebox profile (see the 2026-08-29 update section). |
 | `start_lucebox_docker_qwen36_optimized_prefillcache.sh` | Full configurable Lucebox/Docker launcher. All important runtime knobs are exposed through environment variables. |
+| `start_llamacpp_qwen36_vulkan.sh` | **Recommended for long context:** native llama.cpp (Vulkan release binaries, port 8010) with token-exact KV reuse. Measured numbers in the script header and the update section. |
+| `start_llamacpp_qwen36.sh` | llama.cpp CUDA variant via Docker (untested on the reference machine; the image pull kept failing over IPv6). |
+| `lucebox_warmkeeper.py` | Experimental idle-time cache-refresh proxy for Lucebox. Kept for reference — ineffective against current Lucebox (in-memory snapshot index), see update section. |
 
 ---
 
@@ -196,6 +250,8 @@ Tests with larger chunks, including `2048`, did not improve TTFT on the referenc
 ---
 
 ## Context window
+
+> **Superseded (2026-08-29):** large contexts up to 128k are now practical with Lucebox by setting `KVFLASH_SIZE` alongside `MAX_CTX` (the launcher couples them automatically), at only ~4 % decode cost. The auto-fit/8K advice below predates that finding — see the update section at the top. Note that Lucebox warm TTFT still degrades with session length; for long agent sessions prefer `start_llamacpp_qwen36_vulkan.sh`.
 
 The benchmarked profile leaves:
 
@@ -1254,6 +1310,12 @@ The resulting stack is not intended to maximize every metric simultaneously. It 
 ---
 
 # Quick reference
+
+Start the llama.cpp long-context alternative (port 8010, recommended for long agent sessions):
+
+```bash
+./start_llamacpp_qwen36_vulkan.sh
+```
 
 Install:
 

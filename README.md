@@ -29,8 +29,6 @@ Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
 
 Qwen3.6-35B-A3B is a Mixture-of-Experts model. The Q4_K_M GGUF is roughly 22 GB, so the complete model does not fit into 16 GB VRAM by itself. The launcher keeps attention/dense layers plus a subset of expert layers on the GPU and the remaining experts in system RAM (`--n-cpu-moe`).
 
-Alternative worth trying: **Qwen3.8-27B IQ3_M** will most likely perform better both quality- and speed-wise on the same hardware: <https://huggingface.co/bartowski/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-IQ3_M.gguf>
-
 Download the default model with:
 
 ```bash
